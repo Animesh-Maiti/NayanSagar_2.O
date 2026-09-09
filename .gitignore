@@ -1,0 +1,9 @@
+data/
+*.zip
+*.tar.gz
+ai_engine/weights/*.pt
+ai_engine/weights/*.onnx
+venv/
+__pycache__/
+.DS_Store
+!ai_engine/weights/.gitkeep
