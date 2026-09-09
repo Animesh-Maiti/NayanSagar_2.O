@@ -1,4 +1,4 @@
-"""Production-ready YOLO11s-seg inference wrapper and synthetic fallback for sonar hazard detection."""
+"""Production-ready YOLO11s-seg + unsupervised sonar autoencoder dual-stage inference layer."""
 
 from __future__ import annotations
 
@@ -10,17 +10,59 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
 
 try:
     from ultralytics import YOLO
 except ImportError:
     YOLO = None
 
+from ai_engine.verifier import detect_acoustic_shadow, verify_hazard_relief
+
 LOGGER = logging.getLogger(__name__)
 
 
+class SonarAutoencoder(nn.Module):
+    """Unsupervised 1-channel 256x256 sonar reconstruction autoencoder.
+
+    Network matches the shipped checkpoint key pattern by ordering
+    Conv2d -> BatchNorm2d -> LeakyReLU(0.2) in the encoder and
+    ConvTranspose2d -> BatchNorm2d -> LeakyReLU(0.2) in the decoder,
+    followed by the requested Sigmoid reconstruction output.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(16, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+
 class SonarHazardDetector:
-    """Thread-safe singleton loader and prediction interface for YOLO11s-seg sonar hazards."""
+    """Thread-safe singleton loader and prediction interface for YOLO11s-seg and the dual-stage sonar engine."""
 
     _instance: "SonarHazardDetector | None" = None
     _lock = threading.Lock()
@@ -40,23 +82,27 @@ class SonarHazardDetector:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, weights_path: str | Path | None = None):
+    def __init__(self, weights_path: str | Path | None = None, autoencoder_path: str | Path | None = None):
         if hasattr(self, '_initialized'):
             return
         self._initialized = True
         self.weights_path = Path(weights_path or Path('ai_engine/weights/best.pt'))
+        self.autoencoder_path = Path(autoencoder_path or Path('ai_engine/weights/sonar_autoencoder.pt'))
         self.model = None
+        self.autoencoder = SonarAutoencoder()
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.class_colors = {
             'shipwreck': (0, 0, 255),
             'aircraft_wreck': (255, 0, 0),
             'crab_pot_trap': (0, 192, 255),
             'ghost_net': (0, 255, 0),
             'debris_highlight': (255, 255, 0),
+            'uncataloged_hazard': (0, 0, 255),
         }
         self._load_model()
 
     def _load_model(self):
-        """Load best.pt when available. Otherwise warn and remain in synthetic fallback mode."""
+        """Load best.pt and sonar_autoencoder.pt when available; otherwise degrade gracefully."""
         if self.weights_path.exists() and YOLO is not None:
             try:
                 self.model = YOLO(str(self.weights_path))
@@ -65,8 +111,29 @@ class SonarHazardDetector:
                 LOGGER.warning('Unable to load %s; switching to synthetic fallback: %s', self.weights_path, exc)
                 self.model = None
         else:
-            LOGGER.warning('No model checkpoint found at %s; returning synthetic detections for UI continuity.', self.weights_path)
+            LOGGER.warning('No YOLO weights found at %s; synthetic fallback detection is active.', self.weights_path)
             self.model = None
+
+        if self.autoencoder_path.exists():
+            try:
+                state = torch.load(str(self.autoencoder_path), map_location=self.device)
+                if isinstance(state, dict) and 'state_dict' in state:
+                    state = state['state_dict']
+                if isinstance(state, dict):
+                    self.autoencoder.load_state_dict(state)
+                else:
+                    self.autoencoder.load_state_dict(state.state_dict())
+                self.autoencoder.to(self.device)
+                self.autoencoder.eval()
+                LOGGER.info('Loaded autoencoder weights from %s on %s', self.autoencoder_path, self.device)
+            except Exception as exc:
+                LOGGER.warning('Unable to load autoencoder checkpoint %s; continuing with a random, evaluation-ready fallback: %s', self.autoencoder_path, exc)
+                self.autoencoder = SonarAutoencoder().to(self.device)
+                self.autoencoder.eval()
+        else:
+            LOGGER.warning('No autoencoder checkpoint found at %s; creating a randomly initialized evaluation model.', self.autoencoder_path)
+            self.autoencoder = SonarAutoencoder().to(self.device)
+            self.autoencoder.eval()
 
     def _synthetic_detections(self, image_bgr):
         """Generate a small set of realistic synthetic polygon detections when weights are absent."""
@@ -95,31 +162,23 @@ class SonarHazardDetector:
         return detections
 
     def predict_tile(self, image_bgr, conf_overrides=None, remap_enabled=True):
-        """Run segmentation inference with fallback and emit normalized detection records.
-
-        Returns a list of records shaped as:
-        [{'class_name': str, 'confidence': float, 'bbox': [int, int, int, int], 'contour': np.ndarray}]
-        """
+        """Run segmentation inference with fallback and emit normalized detection records."""
         if image_bgr is None:
             raise ValueError('image_bgr must not be None')
         image_bgr = np.asarray(image_bgr)
         if image_bgr.ndim != 3:
-            # Accept grayscale arrays by wrapping into 3 channel BGR.
             if image_bgr.ndim == 2:
                 image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
             else:
                 raise ValueError('image_bgr must be a BGR image array with 3 color channels')
 
-        synthetic = False
+        dets = []
         if self.model is None:
-            synthetic = True
-            detections = self._synthetic_detections(image_bgr)
-            return self._postprocess(detections, conf_overrides=conf_overrides, remap_enabled=remap_enabled)
+            dets = self._synthetic_detections(image_bgr)
+            return self._postprocess(dets, conf_overrides=conf_overrides, remap_enabled=remap_enabled)
 
-        detections = []
         try:
             results = self.model.predict(image_bgr, conf=0.12, imgsz=640, verbose=False)
-            # Expect at least one result object from ultralytics.
             for result in results:
                 boxes = getattr(result, 'boxes', None)
                 masks = getattr(result, 'masks', None)
@@ -141,33 +200,25 @@ class SonarHazardDetector:
                         if conf_overrides:
                             override = conf_overrides.get(class_name, conf)
                             conf = float(override)
-                        class_record = {
+                        dets.append({
                             'class_name': class_name,
                             'confidence': conf,
                             'bbox': bbox,
                             'contour': contour,
-                        }
-                        detections.append(class_record)
+                        })
         except Exception as exc:
-            LOGGER.warning('Inference failed; returning synthetic fallback due to %s', exc)
-            synthetic = True
-            detections = self._synthetic_detections(image_bgr)
+            LOGGER.warning('YOLO inference failed; returning synthetic fallback due to %s', exc)
+            dets = self._synthetic_detections(image_bgr)
 
-        if synthetic:
-            return self._postprocess(detections, conf_overrides=conf_overrides, remap_enabled=remap_enabled)
-        return self._postprocess(detections, conf_overrides=conf_overrides, remap_enabled=remap_enabled)
+        return self._postprocess(dets, conf_overrides=conf_overrides, remap_enabled=remap_enabled)
 
     def _postprocess(self, detections, conf_overrides=None, remap_enabled=True):
         """Apply threshold overrides and class name remapping in a safe, deterministic order."""
-        from ai_engine.postprocess import CLASS_REMAP, DEFAULT_CONF_THRESHOLDS, filter_and_remap
-        filtered = []
-        # Filter and remap using shared process.
+        from ai_engine.postprocess import filter_and_remap
         filtered = filter_and_remap(detections=detections, custom_thresholds=conf_overrides, remap_enabled=remap_enabled)
-        # Normalize output contour and bbox structure.
         records = []
         for det in filtered:
             class_name = str(det.get('class_name') or det.get('label') or det.get('hazard_class') or 'unknown')
-            # Apply confidence override for class-level thresholds.
             conf = float(det.get('confidence', 0.0))
             bbox = det.get('bbox')
             contour = det.get('contour')
@@ -182,32 +233,191 @@ class SonarHazardDetector:
             records.append(record)
         return records
 
-    def draw_annotations(self, image_bgr, detections):
-        """Return a color-coded segmented visualization with alpha mask and bounding boxes."""
-        overlay = image_bgr.copy().astype(np.uint8)
-        if overlay.ndim == 2:
-            overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
-        # Create a blank image in BGR. Apply alpha mask blending.
-        mask_canvas = np.zeros_like(overlay, dtype=np.uint8)
-        out = overlay.copy()
-        for det in detections:
-            class_name = str(det.get('class_name') or 'unknown')
-            color = self.class_colors.get(class_name, (128, 128, 128))
-            contour = np.asarray(det.get('contour'))
+    def predict_dual_stage(self, image_bgr, conf=0.18):
+        """Run the dual-stage pipeline with hydrographic shadow and relief verification gates."""
+        if image_bgr is None:
+            raise ValueError('image_bgr must not be None')
+
+        # Stage 1: supervised YOLO segmentation pass.
+        detections = self.predict_tile(image_bgr, conf_overrides={'shipwreck': conf, 'aircraft_wreck': conf, 'ghost_net': conf, 'debris_highlight': conf, 'crab_pot_trap': conf}, remap_enabled=True)
+        if detections:
+            candidates = []
+            for det in detections:
+                class_name = det.get('class_name', 'unknown')
+                conf_score = max(0.0, min(1.0, float(det.get('confidence', 0.0))))
+                bbox = det.get('bbox')
+                contour = np.asarray(det.get('contour')) if det.get('contour') is not None else np.zeros((0, 2), dtype=np.int32)
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    x1, y1, x2, y2 = [int(v) for v in bbox]
+                    bbox = [x1, y1, x2, y2]
+                else:
+                    bbox = [0, 0, 0, 0]
+
+                shadow = detect_acoustic_shadow(image_bgr, bbox)
+                height_info = verify_hazard_relief(shadow['shadow_length_px'], towfish_altitude_m=12.0, slant_range_m=50.0, meters_per_pixel=0.1)
+                if height_info['is_valid_hazard']:
+                    status = 'VERIFIED_HAZARD'
+                    estimate = height_info['estimated_height_m']
+                else:
+                    status = 'UNVERIFIED_CLUTTER'
+                    estimate = height_info['estimated_height_m']
+
+                record = {
+                    'detection_type': 'SUPERVISED',
+                    'class_name': class_name,
+                    'confidence': conf_score,
+                    'bbox': bbox,
+                    'contour': contour,
+                    'verification_status': status,
+                    'estimated_height_m': estimate,
+                    'has_shadow': shadow['has_shadow'],
+                    'shadow_length_px': shadow['shadow_length_px'],
+                }
+                candidates.append(record)
+            return candidates
+
+        # Stage 2: unsupervised autoencoder anomaly pass.
+        anomaly_candidates = self._predict_unsupervised_anomaly(image_bgr)
+        verified_candidates = []
+        for det in anomaly_candidates:
             bbox = det.get('bbox')
-            if contour is not None and contour.size:
-                contour = np.asarray(contour, dtype=np.int32)
-                cv2.drawContours(mask_canvas, [contour], -1, color, thickness=-1)
-            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                x1, y1, x2, y2 = [int(v) for v in bbox]
-                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(out, class_name, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        # alpha-blended overlay
-        alpha_mask = np.zeros_like(mask_canvas, dtype=np.uint8)
-        alpha_mask[:, :, :] = 0
-        # Place a soft color overlay on the mask area.
-        mask_weight = cv2.cvtColor(mask_canvas, cv2.COLOR_BGR2GRAY)
-        # Combine by threshold of nonzero color intensity.
-        alpha_channel = np.where(mask_weight > 0, 255, 0).astype(np.uint8)
-        blended = cv2.addWeighted(out, 1.0, mask_canvas, 0.4, 0)
-        return blended
+            contour = np.asarray(det.get('contour')) if det.get('contour') is not None else np.zeros((0, 2), dtype=np.int32)
+            shadow = detect_acoustic_shadow(image_bgr, bbox)
+            height_info = verify_hazard_relief(shadow['shadow_length_px'], towfish_altitude_m=12.0, slant_range_m=50.0, meters_per_pixel=0.1)
+            if height_info['is_valid_hazard']:
+                status = 'VERIFIED_HAZARD'
+                estimate = height_info['estimated_height_m']
+            else:
+                status = 'UNVERIFIED_CLUTTER'
+                estimate = height_info['estimated_height_m']
+            record = {
+                'detection_type': 'UNSUPERVISED_ANOMALY',
+                'class_name': 'uncataloged_hazard',
+                'confidence': float(det.get('confidence', 0.0)),
+                'bbox': bbox,
+                'contour': contour,
+                'verification_status': status,
+                'estimated_height_m': estimate,
+                'has_shadow': shadow['has_shadow'],
+                'shadow_length_px': shadow['shadow_length_px'],
+            }
+            verified_candidates.append(record)
+        return verified_candidates
+
+    def _predict_unsupervised_anomaly(self, image_bgr):
+        """Generate anomaly detections from the autoencoder reconstruction error map."""
+        if self.autoencoder is None:
+            return []
+
+        image_rgb = image_bgr
+        if image_rgb.ndim == 3:
+            gray = cv2.cvtColor(image_rgb, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image_rgb
+
+        original_h, original_w = gray.shape[:2]
+        resized = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
+        normalized = resized.astype(np.float32) / 255.0
+        input_tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            output_tensor = self.autoencoder(input_tensor)
+
+        input_np = normalized.astype(np.float32)
+        output_np = output_tensor.detach().cpu().squeeze(0).squeeze(0).numpy()
+        error_map = np.abs(input_np - output_np)
+        blurred = cv2.GaussianBlur(error_map, (9, 9), 0)
+
+        # Threshold at the top 1.8% of pixel-level reconstruction error, matching requested percentile rule.
+        threshold = np.percentile(blurred, 98.2)
+        anomaly_mask = (blurred >= threshold).astype(np.uint8) * 255
+
+        contours, _ = cv2.findContours(anomaly_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detections = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 60:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            x1, y1, x2, y2 = x, y, x + w, y + h
+            # Scale to original input image dimensions.
+            x1_s = int(round(x1 * original_w / 256))
+            y1_s = int(round(y1 * original_h / 256))
+            x2_s = int(round(x2 * original_w / 256))
+            y2_s = int(round(y2 * original_h / 256))
+
+            contour_scaled = contour.astype(np.float32)
+            contour_scaled[:, :, 0] = contour_scaled[:, :, 0] * (original_w / 256)
+            contour_scaled[:, :, 1] = contour_scaled[:, :, 1] * (original_h / 256)
+            contour_scaled = contour_scaled.astype(np.int32)
+
+            # Mean reconstruction error from the anomaly map over the contour.
+            mean_error = float(np.mean(blurred[y:y + h, x:x + w])) if w > 0 and h > 0 else 0.0
+            detections.append({
+                'detection_type': 'UNSUPERVISED_ANOMALY',
+                'class_name': 'uncataloged_hazard',
+                'confidence': float(mean_error),
+                'bbox': [x1_s, y1_s, x2_s, y2_s],
+                'contour': contour_scaled,
+            })
+        return detections
+
+    def draw_annotations(self, image_bgr, detections):
+        """Return a color-coded segmented visualization with verification-aware overlays and anomaly contours."""
+        if image_bgr is None:
+            return image_bgr
+        image = np.array(image_bgr, copy=True)
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        overlay = image.copy()
+        if not detections:
+            return overlay
+
+        for det in detections:
+            detection_type = det.get('detection_type', 'SUPERVISED')
+            contour = np.asarray(det.get('contour', np.zeros((0, 2), dtype=np.int32)))
+            bbox = det.get('bbox')
+            status = det.get('verification_status', 'VERIFIED_HAZARD')
+            verified = status == 'VERIFIED_HAZARD'
+            if detection_type == 'UNSUPERVISED_ANOMALY':
+                if verified:
+                    if len(contour) > 0:
+                        cv2.drawContours(overlay, [contour], -1, (0, 0, 255), 2)
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        conf = float(det.get('confidence', 0.0))
+                        height = det.get('estimated_height_m', 0.0)
+                        cv2.putText(overlay, f'[ANOMALY] Uncataloged Hazard | H: {height}m | Conf: {conf:.2f}', (max(0, x1), max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                else:
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (128, 128, 128), 1)
+                        cv2.putText(overlay, '[CLUTTER - NO SHADOW]', (max(0, x1), max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+            else:
+                class_name = det.get('class_name', 'unknown')
+                color = (0, 255, 0)
+                if class_name in {'aircraft_wreck', 'shipwreck'}:
+                    color = (0, 255, 255)
+                if class_name == 'debris_highlight':
+                    color = (0, 200, 255)
+                if class_name == 'ghost_net':
+                    color = (255, 255, 0)
+
+                if verified:
+                    if len(contour) > 0:
+                        cv2.drawContours(overlay, [contour], -1, color, 1)
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                        conf = float(det.get('confidence', 0.0))
+                        height = det.get('estimated_height_m', 0.0)
+                        label = f'{class_name} | H: {height}m | Conf: {conf:.2f}'
+                        cv2.putText(overlay, label, (max(0, x1), max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                else:
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), (180, 180, 180), 1)
+                        cv2.putText(overlay, '[CLUTTER - NO SHADOW]', (max(0, x1), max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+        return overlay
