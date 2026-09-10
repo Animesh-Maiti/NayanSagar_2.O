@@ -6,6 +6,25 @@ import cv2
 import numpy as np
 
 
+def calculate_target_slant_range(bbox, image_width, active_altitude, active_slant_range):
+    """Calculate target slant range from cross-track pixel geometry."""
+    try:
+        x1, _, x2, _ = [float(value) for value in bbox]
+        width = float(image_width)
+        altitude = float(active_altitude)
+        swath_range = float(active_slant_range)
+        if width <= 0 or altitude < 0 or swath_range < 0:
+            return 0.0
+
+        center_x = (x1 + x2) / 2.0
+        dx_px = abs(center_x - (width / 2.0))
+        meters_per_pixel = swath_range / (width / 2.0) if width else 0.0
+        ground_dist_m = dx_px * meters_per_pixel
+        return round(float((altitude**2 + ground_dist_m**2) ** 0.5), 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def detect_acoustic_shadow(tile_gray, bbox, search_direction='auto', shadow_intensity_thresh=30):
     """Detect a downstream acoustic shadow corridor and compute its pixel length.
 
@@ -54,73 +73,42 @@ def detect_acoustic_shadow(tile_gray, bbox, search_direction='auto', shadow_inte
     else:
         direction = 'right'
 
-    # Use a corridor along the object footprint away from nadir. Find contiguous low-intensity region.
-    corridor_x1 = max(0, x1)
-    corridor_x2 = min(img_w, x2)
     y_start = max(0, y1)
     y_end = min(img_h, y2)
+    # Estimate a local seabed background around the target and derive a relative
+    # void threshold. This remains useful after CLAHE and across gain changes.
+    band = image[max(0, y1 - max(4, (y2 - y1) // 2)):min(img_h, y2 + max(4, (y2 - y1) // 2) + 1)]
+    background_samples = np.concatenate(
+        [band[:, :max(1, x1)], band[:, min(img_w, x2 + 1):]], axis=1
+    ) if x1 > 0 or x2 + 1 < img_w else band
+    background = float(np.percentile(background_samples, 60)) if background_samples.size else float(shadow_intensity_thresh)
+    dynamic_threshold = min(float(shadow_intensity_thresh), max(8.0, background * 0.55))
 
-    if direction == 'right':
-        search_xs = range(corridor_x2, img_w)
-    else:
-        search_xs = range(corridor_x1 - 1, -1, -1)
+    search_start = x2 if direction == 'right' else x1 - 1
+    search_stop = img_w if direction == 'right' else -1
+    search_step = 1 if direction == 'right' else -1
+    row_hits = []
+    for yy in range(y_start, y_end + 1):
+        run = []
+        for xx in range(search_start, search_stop, search_step):
+            if float(image[yy, xx]) < dynamic_threshold:
+                run.append(xx)
+            elif run:
+                break
+        if len(run) >= 2:
+            row_hits.append((yy, run))
 
-    # Downstream corridor is in the same row band as bbox; sample a vertical band around highlight.
-    mask = np.zeros_like(image, dtype=np.uint8)
-    for row in range(y_start, min(y_end + 1, img_h)):
-        for col in range(corridor_x1, min(corridor_x2 + 1, img_w)):
-            if image[row, col] < shadow_intensity_thresh:
-                mask[row, col] = 255
+    if not row_hits:
+        return {'has_shadow': False, 'shadow_length_px': 0.0, 'shadow_bbox': [0, 0, 0, 0]}
 
-    # Expand to search corridor downstream away from the object center.
-    shadow_pixels = []
-    for yy in range(y_start, min(y_end + 1, img_h)):
-        for xx in range(corridor_x1, min(corridor_x2 + 1, img_w)):
-            if image[yy, xx] < shadow_intensity_thresh:
-                shadow_pixels.append((yy, xx))
-
-    # Use the object mask contiguity if there are low-intensity pixels below threshold. Estimate width as max contiguous length.
-    shadow_len_px = 0.0
-    shadow_x1 = img_w
-    shadow_y1 = img_h
-    shadow_x2 = 0
-    shadow_y2 = 0
-
-    for yy in range(y_start, min(y_end + 1, img_h)):
-        reaching = False
-        x_lo = None
-        for xx in range(corridor_x1, min(corridor_x2 + 1, img_w)):
-            # Search from bbox edge to downstream side.
-            if direction == 'right':
-                corridor_col = xx
-            else:
-                corridor_col = -1 - xx
-            if image[yy, min(img_w - 1, max(0, corridor_col))] < shadow_intensity_thresh:
-                reaching = True
-                if x_lo is None:
-                    x_lo = xx
-                shadow_len_px = max(shadow_len_px, abs(xx - x1))
-                shadow_x1 = min(shadow_x1, xx)
-                shadow_y1 = min(shadow_y1, yy)
-                shadow_x2 = max(shadow_x2, xx)
-                shadow_y2 = max(shadow_y2, yy)
-        if reaching:
-            pass
-    if shadow_len_px <= 0:
-        # fallback from low intensity contiguous pixels in a downstream object-aligned search band.
-        if shadow_pixels:
-            ys, xs = zip(*shadow_pixels)
-            shadow_len_px = float(max(xs) - min(xs))
-            shadow_x1 = min(xs)
-            shadow_y1 = min(ys)
-            shadow_x2 = max(xs)
-            shadow_y2 = max(ys)
-
-    has_shadow = shadow_len_px >= 1.0
+    shadow_xs = [x for _, run in row_hits for x in run]
+    shadow_ys = [y for y, run in row_hits for _ in run]
+    edge = x2 if direction == 'right' else x1
+    shadow_len_px = max(abs(x - edge) + 1 for x in shadow_xs)
     return {
-        'has_shadow': bool(has_shadow),
+        'has_shadow': True,
         'shadow_length_px': float(shadow_len_px),
-        'shadow_bbox': [int(shadow_x1), int(shadow_y1), int(shadow_x2), int(shadow_y2)],
+        'shadow_bbox': [int(min(shadow_xs)), int(min(shadow_ys)), int(max(shadow_xs)), int(max(shadow_ys))],
     }
 
 

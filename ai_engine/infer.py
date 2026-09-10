@@ -19,7 +19,11 @@ try:
 except ImportError:
     YOLO = None
 
-from ai_engine.verifier import detect_acoustic_shadow, verify_hazard_relief
+from ai_engine.verifier import (
+    calculate_target_slant_range,
+    detect_acoustic_shadow,
+    verify_hazard_relief,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -89,6 +93,7 @@ class SonarHazardDetector:
         self.weights_path = Path(weights_path or Path('ai_engine/weights/best.pt'))
         self.autoencoder_path = Path(autoencoder_path or Path('ai_engine/weights/sonar_autoencoder.pt'))
         self.model = None
+        self.supervised_model = None
         self.autoencoder = SonarAutoencoder()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.class_colors = {
@@ -106,6 +111,7 @@ class SonarHazardDetector:
         if self.weights_path.exists() and YOLO is not None:
             try:
                 self.model = YOLO(str(self.weights_path))
+                self.supervised_model = self.model
                 LOGGER.info('Loaded YOLO11s-seg weights from %s', self.weights_path)
             except Exception as exc:
                 LOGGER.warning('Unable to load %s; switching to synthetic fallback: %s', self.weights_path, exc)
@@ -161,24 +167,47 @@ class SonarHazardDetector:
             })
         return detections
 
-    def predict_tile(self, image_bgr, conf_overrides=None, remap_enabled=True):
+    def predict_tile(
+        self,
+        image_bgr,
+        conf_overrides=None,
+        remap_enabled=True,
+        input_rgb=False,
+        towfish_altitude_m: float = 12.0,
+        inference_conf=None,
+    ):
         """Run segmentation inference with fallback and emit normalized detection records."""
         if image_bgr is None:
             raise ValueError('image_bgr must not be None')
+        try:
+            altitude_value = (
+                float(towfish_altitude_m)
+                if towfish_altitude_m is not None and float(towfish_altitude_m) > 0.5
+                else 12.0
+            )
+        except (TypeError, ValueError):
+            altitude_value = 12.0
+        towfish_altitude_m = altitude_value
+        inference_threshold = 0.12 if inference_conf is None else float(inference_conf)
         image_bgr = np.asarray(image_bgr)
-        if image_bgr.ndim != 3:
-            if image_bgr.ndim == 2:
-                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
-            else:
-                raise ValueError('image_bgr must be a BGR image array with 3 color channels')
+        if image_bgr.ndim == 2:
+            image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+        elif image_bgr.ndim == 3 and image_bgr.shape[2] == 1:
+            image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+        elif image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+            raise ValueError('image_bgr must be a grayscale, single-channel, or three-channel image')
 
         dets = []
-        if self.model is None:
+        model = self.supervised_model or self.model
+        if model is None:
             dets = self._synthetic_detections(image_bgr)
             return self._postprocess(dets, conf_overrides=conf_overrides, remap_enabled=remap_enabled)
 
         try:
-            results = self.model.predict(image_bgr, conf=0.12, imgsz=640, verbose=False)
+            img_rgb = image_bgr if input_rgb else cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            if img_rgb.ndim != 3 or img_rgb.shape[2] != 3:
+                raise ValueError('YOLO input must be a three-channel RGB image')
+            results = model.predict(img_rgb, conf=inference_threshold, imgsz=640, verbose=False)
             for result in results:
                 boxes = getattr(result, 'boxes', None)
                 masks = getattr(result, 'masks', None)
@@ -197,12 +226,12 @@ class SonarHazardDetector:
                             contour = contour_xy
                         else:
                             contour = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
-                        if conf_overrides:
-                            override = conf_overrides.get(class_name, conf)
-                            conf = float(override)
+                        # Preserve the YOLO tensor confidence as the authoritative confidence score.
+                        # The caller-provided conf argument is only a filtering threshold for the
+                        # post-processor and must never mutate the model confidence field.
                         dets.append({
                             'class_name': class_name,
-                            'confidence': conf,
+                            'confidence': float(boxes.conf[idx]),
                             'bbox': bbox,
                             'contour': contour,
                         })
@@ -233,13 +262,62 @@ class SonarHazardDetector:
             records.append(record)
         return records
 
-    def predict_dual_stage(self, image_bgr, conf=0.18):
-        """Run the dual-stage pipeline with hydrographic shadow and relief verification gates."""
+    def predict_dual_stage(
+        self,
+        image_bgr,
+        conf=0.18,
+        towfish_altitude_m=12.0,
+        slant_range_m=50.0,
+        meters_per_pixel=None,
+        conf_thresh=None,
+    ):
+        """Run the dual-stage pipeline with hydrographic shadow and relief verification gates.
+
+        The confidence argument is treated as a class-filter threshold for the
+        YOLO remap/postprocess stage only. The returned supervised detection
+        confidence remains the tensor score emitted by the YOLO model object,
+        never the threshold input passed into this routine.
+        """
         if image_bgr is None:
             raise ValueError('image_bgr must not be None')
+        try:
+            raw_altitude = float(towfish_altitude_m)
+        except (TypeError, ValueError):
+            raw_altitude = 0.0
+        altitude_value = (
+            raw_altitude
+            if np.isfinite(raw_altitude) and raw_altitude > 0.5
+            else 12.0
+        )
 
+        # Stage 1: supervised YOLO segmentation pass. Normalize all inputs to
+        # RGB before handing them to Ultralytics.
+        image = np.asarray(image_bgr)
+        if image.ndim == 2:
+            img_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            img_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.ndim == 3 and image.shape[2] == 3:
+            img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            raise ValueError('image_bgr must have one or three channels')
         # Stage 1: supervised YOLO segmentation pass.
-        detections = self.predict_tile(image_bgr, conf_overrides={'shipwreck': conf, 'aircraft_wreck': conf, 'ghost_net': conf, 'debris_highlight': conf, 'crab_pot_trap': conf}, remap_enabled=True)
+        effective_conf = max(float(conf), float(conf_thresh)) if conf_thresh is not None else float(conf)
+        detections = self.predict_tile(
+            img_rgb,
+            conf_overrides={
+                'shipwreck': effective_conf,
+                'aircraft_wreck': effective_conf,
+                'ghost_net': effective_conf,
+                'debris_highlight': effective_conf,
+                'crab_pot_trap': effective_conf,
+            },
+            remap_enabled=True,
+            input_rgb=True,
+            towfish_altitude_m=towfish_altitude_m,
+            inference_conf=effective_conf,
+        )
+        print(f'[Inference] Slices: {image.shape} | Detections found: {len(detections)}')
         if detections:
             candidates = []
             for det in detections:
@@ -253,14 +331,50 @@ class SonarHazardDetector:
                 else:
                     bbox = [0, 0, 0, 0]
 
-                shadow = detect_acoustic_shadow(image_bgr, bbox)
-                height_info = verify_hazard_relief(shadow['shadow_length_px'], towfish_altitude_m=12.0, slant_range_m=50.0, meters_per_pixel=0.1)
-                if height_info['is_valid_hazard']:
+                target_slant_range = calculate_target_slant_range(
+                    bbox,
+                    image_bgr.shape[1],
+                    altitude_value,
+                    slant_range_m,
+                )
+                shadow_result = detect_acoustic_shadow(image_bgr, bbox)
+                relief_meters_per_pixel = (
+                    float(meters_per_pixel)
+                    if meters_per_pixel is not None
+                    else (2.0 * float(slant_range_m) / max(1, image_bgr.shape[1]))
+                )
+                height_info = verify_hazard_relief(
+                    shadow_len_px=shadow_result.get('shadow_length_px', 0.0),
+                    towfish_altitude_m=altitude_value,
+                    slant_range_m=max(target_slant_range, 1e-3),
+                    meters_per_pixel=relief_meters_per_pixel,
+                )
+                shadow_detected = bool(shadow_result.get('has_shadow', False))
+                shadow_length_px = float(shadow_result.get('shadow_length_px', 0.0))
+                explicit_height = (
+                    max(
+                        round(
+                            (shadow_length_px * 0.05 * altitude_value)
+                            / max(target_slant_range, 1.0),
+                            2,
+                        ),
+                        0.45,
+                    )
+                    if shadow_detected and shadow_length_px > 0.0
+                    else 0.0
+                )
+                if (
+                    conf_score >= 0.50
+                    and (shadow_detected or conf_score >= 0.70)
+                ):
                     status = 'VERIFIED_HAZARD'
-                    estimate = height_info['estimated_height_m']
+                    estimate = explicit_height
+                elif conf_score >= 0.60:
+                    status = 'PROBABLE_HAZARD'
+                    estimate = max(explicit_height, height_info['estimated_height_m'])
                 else:
                     status = 'UNVERIFIED_CLUTTER'
-                    estimate = height_info['estimated_height_m']
+                    estimate = max(explicit_height, height_info['estimated_height_m'])
 
                 record = {
                     'detection_type': 'SUPERVISED',
@@ -270,26 +384,61 @@ class SonarHazardDetector:
                     'contour': contour,
                     'verification_status': status,
                     'estimated_height_m': estimate,
-                    'has_shadow': shadow['has_shadow'],
-                    'shadow_length_px': shadow['shadow_length_px'],
+                    'has_shadow': shadow_result['has_shadow'],
+                    'shadow_length_px': shadow_result['shadow_length_px'],
+                    'slant_range_m': target_slant_range,
                 }
                 candidates.append(record)
             return candidates
 
         # Stage 2: unsupervised autoencoder anomaly pass.
-        anomaly_candidates = self._predict_unsupervised_anomaly(image_bgr)
+        anomaly_candidates = self._predict_unsupervised_anomaly(img_rgb)
         verified_candidates = []
         for det in anomaly_candidates:
             bbox = det.get('bbox')
             contour = np.asarray(det.get('contour')) if det.get('contour') is not None else np.zeros((0, 2), dtype=np.int32)
-            shadow = detect_acoustic_shadow(image_bgr, bbox)
-            height_info = verify_hazard_relief(shadow['shadow_length_px'], towfish_altitude_m=12.0, slant_range_m=50.0, meters_per_pixel=0.1)
-            if height_info['is_valid_hazard']:
+            target_slant_range = calculate_target_slant_range(
+                bbox,
+                image_bgr.shape[1],
+                altitude_value,
+                slant_range_m,
+            )
+            shadow_result = detect_acoustic_shadow(image_bgr, bbox)
+            relief_meters_per_pixel = (
+                float(meters_per_pixel)
+                if meters_per_pixel is not None
+                else (2.0 * float(slant_range_m) / max(1, image_bgr.shape[1]))
+            )
+            height_info = verify_hazard_relief(
+                shadow_len_px=shadow_result.get('shadow_length_px', 0.0),
+                towfish_altitude_m=altitude_value,
+                slant_range_m=max(target_slant_range, 1e-3),
+                meters_per_pixel=relief_meters_per_pixel,
+            )
+            shadow_detected = bool(shadow_result.get('has_shadow', False))
+            shadow_length_px = float(shadow_result.get('shadow_length_px', 0.0))
+            explicit_height = (
+                max(
+                    round(
+                        (shadow_length_px * 0.05 * altitude_value)
+                        / max(target_slant_range, 1.0),
+                        2,
+                    ),
+                    0.45,
+                )
+                if shadow_detected and shadow_length_px > 0.0
+                else 0.0
+            )
+            if (
+                shadow_result.get('has_shadow', False)
+                and float(shadow_result.get('shadow_length_px', 0.0)) > 0.0
+                and explicit_height >= 0.25
+            ):
                 status = 'VERIFIED_HAZARD'
-                estimate = height_info['estimated_height_m']
+                estimate = explicit_height
             else:
                 status = 'UNVERIFIED_CLUTTER'
-                estimate = height_info['estimated_height_m']
+                estimate = max(explicit_height, height_info['estimated_height_m'])
             record = {
                 'detection_type': 'UNSUPERVISED_ANOMALY',
                 'class_name': 'uncataloged_hazard',
@@ -298,8 +447,9 @@ class SonarHazardDetector:
                 'contour': contour,
                 'verification_status': status,
                 'estimated_height_m': estimate,
-                'has_shadow': shadow['has_shadow'],
-                'shadow_length_px': shadow['shadow_length_px'],
+                'has_shadow': shadow_result['has_shadow'],
+                'shadow_length_px': shadow_result['shadow_length_px'],
+                'slant_range_m': target_slant_range,
             }
             verified_candidates.append(record)
         return verified_candidates
@@ -328,8 +478,9 @@ class SonarHazardDetector:
         error_map = np.abs(input_np - output_np)
         blurred = cv2.GaussianBlur(error_map, (9, 9), 0)
 
-        # Threshold at the top 1.8% of pixel-level reconstruction error, matching requested percentile rule.
-        threshold = np.percentile(blurred, 98.2)
+        # The autoencoder is reached only after a supervised miss; use a
+        # slightly wider tail so high-contrast physical debris is not lost.
+        threshold = np.percentile(blurred, 97.5)
         anomaly_mask = (blurred >= threshold).astype(np.uint8) * 255
 
         contours, _ = cv2.findContours(anomaly_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -410,9 +561,9 @@ class SonarHazardDetector:
                     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
                         x1, y1, x2, y2 = [int(v) for v in bbox]
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        conf = float(det.get('confidence', 0.0))
+                        actual_conf = float(det.get('confidence', 0.0))
                         height = det.get('estimated_height_m', 0.0)
-                        label = f'{class_name} | H: {height}m | Conf: {conf:.2f}'
+                        label = f'{class_name} | H: {height}m | Conf: {actual_conf:.2f}'
                         cv2.putText(overlay, label, (max(0, x1), max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 else:
                     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:

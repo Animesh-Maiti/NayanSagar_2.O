@@ -8,40 +8,57 @@ from typing import Iterable
 import numpy as np
 
 
-def slice_waterfall(waterfall_matrix, tile_size=640, overlap_pct=0.15):
-    """Slide a rectangular tile across a 2D waterfall matrix and yield tiles with global offsets.
+def slice_waterfall(waterfall_img, tile_size=640, overlap=128):
+    """Return a list of overlapping tiles with source offsets as requested by the Streamlit dashboard.
 
-    Yields
-    ------
-    tuple[np.ndarray, tuple[int, int, int, int]]
-        (tile_image, (y1, x1, y2, x2)) where coordinates are bounded against source matrix.
+    Parameters
+    ----------
+    waterfall_img:
+        2D grayscale or color matrix.
+    tile_size:
+        Target square tile size. Defaults to 640.
+    overlap:
+        Pixel overlap between adjacent windows. Defaults to 100.
+
+    Returns
+    -------
+    list[tuple[np.ndarray, int, int, str]]
+        Each tuple contains (tile, x_offset, y_offset, slice_id).
     """
-    matrix = np.asarray(waterfall_matrix)
+    matrix = np.asarray(waterfall_img)
     if matrix.ndim != 2:
-        raise ValueError('waterfall_matrix must be a 2D numpy array')
+        raise ValueError('waterfall_img must be a 2D numpy array')
     if tile_size <= 0:
         raise ValueError('tile_size must be a positive integer')
-    if not 0 <= overlap_pct < 1:
-        raise ValueError('overlap_pct must be in the range [0, 1)')
+    if overlap < 0:
+        raise ValueError('overlap must be a non-negative integer')
 
-    stride = max(1, int(round(tile_size * (1 - overlap_pct))))
-    h, w = matrix.shape
-    y = 0
-    while y < h:
-        x = 0
-        while x < w:
-            y2 = min(y + tile_size, h)
-            x2 = min(x + tile_size, w)
+    rows, cols = matrix.shape
+    if rows == 0 or cols == 0:
+        return []
+
+    stride = max(1, tile_size - overlap)
+
+    def window_starts(length):
+        if length <= tile_size:
+            return [0]
+        starts = list(range(0, length - tile_size + 1, stride))
+        final_start = length - tile_size
+        if starts[-1] != final_start:
+            starts.append(final_start)
+        return starts
+
+    slices = []
+    slice_id = 0
+    for y in window_starts(rows):
+        for x in window_starts(cols):
+            y2 = min(y + tile_size, rows)
+            x2 = min(x + tile_size, cols)
             tile = matrix[y:y2, x:x2]
-            if tile.size == 0:
-                break
-            yield tile, (y, x, y2, x2)
-            if x2 >= w:
-                break
-            x += stride
-        if y2 >= h:
-            break
-        y += stride
+            slices.append((tile.copy(), x, y, f'slice_{slice_id:04d}'))
+            slice_id += 1
+
+    return slices
 
 
 def remap_to_global_coords(tile_detections, global_offset):
